@@ -55,10 +55,26 @@ def window(pct, resets_at):
     return {"pct": round(float(pct or 0), 1), "resets_at": resets_at}
 
 
+PLAN_NAMES = {"free": "Free", "plus": "Plus", "pro": "Pro", "max": "Max", "team": "Team",
+              "business": "Business", "enterprise": "Enterprise", "edu": "Edu"}
+
+
+def plan_label(raw):
+    if not raw:
+        return None
+    return PLAN_NAMES.get(raw.lower(), raw.replace("_", " ").title())
+
+
 def fetch_claude():
     path = os.path.join(HOME, ".claude", ".credentials.json")
     with open(path) as f:
-        tok = json.load(f)["claudeAiOauth"]["accessToken"]
+        creds = json.load(f)["claudeAiOauth"]
+    tok = creds["accessToken"]
+    plan = plan_label(creds.get("subscriptionType"))
+    # Max comes in 5x / 20x variants, only visible in the rate-limit tier name.
+    mult = re.search(r"(\d+x)", creds.get("rateLimitTier") or "")
+    if plan == "Max" and mult:
+        plan += " " + mult[1]
     d = http_json(
         "https://api.anthropic.com/api/oauth/usage",
         {
@@ -69,6 +85,7 @@ def fetch_claude():
     )
     fh, wk = d.get("five_hour") or {}, d.get("seven_day") or {}
     return {
+        "plan": plan,
         "five_hour": window(fh.get("utilization"), iso_to_epoch(fh.get("resets_at"))),
         "weekly": window(wk.get("utilization"), iso_to_epoch(wk.get("resets_at"))),
     }
@@ -89,7 +106,7 @@ def fetch_codex():
     rl = d.get("rate_limit") or {}
     p, s = rl.get("primary_window") or {}, rl.get("secondary_window") or {}
     return {
-        "plan": d.get("plan_type"),
+        "plan": plan_label(d.get("plan_type")),
         "five_hour": window(p.get("used_percent"), p.get("reset_at")),
         "weekly": window(s.get("used_percent"), s.get("reset_at")),
     }
@@ -163,21 +180,28 @@ def agy_access_token():
     return access
 
 
+def agy_plan(headers):
+    """Subscription name from the account info agy loads at startup, e.g. "Pro"."""
+    d = http_json(AGY_API + "loadCodeAssist", headers,
+                  data=json.dumps({"metadata": {"ideType": "ANTIGRAVITY", "pluginType": "GEMINI"}}).encode())
+    paid = (d.get("paidTier") or {}).get("name")
+    if paid:
+        return re.sub(r"^Google AI\s+", "", paid)  # "Google AI Pro" -> "Pro"
+    return "Free" if (d.get("currentTier") or {}).get("id") == "free-tier" else None
+
+
 def fetch_agy():
     try:
         with open(AGY_PROJECT_FILE) as f:
             body = {"project": f.read().strip()}
     except OSError:
         body = {}
-    d = http_json(
-        AGY_API + "retrieveUserQuotaSummary",
-        {
-            "Authorization": "Bearer " + agy_access_token(),
-            "Content-Type": "application/json",
-            "User-Agent": "antigravity",  # the endpoint answers 403 without it
-        },
-        data=json.dumps(body).encode(),
-    )
+    headers = {
+        "Authorization": "Bearer " + agy_access_token(),
+        "Content-Type": "application/json",
+        "User-Agent": "antigravity",  # the endpoint answers 403 without it
+    }
+    d = http_json(AGY_API + "retrieveUserQuotaSummary", headers, data=json.dumps(body).encode())
     groups = []
     for g in d.get("groups") or []:
         grp = {"name": g.get("displayName", "?")}
@@ -192,7 +216,11 @@ def fetch_agy():
         raise RuntimeError("no quota groups in response")
     # The panel shows the Gemini group; every group is listed in the menu.
     main = next((g for g in groups if g["name"].lower().startswith("gemini")), groups[0])
-    return {"five_hour": main["five_hour"], "weekly": main["weekly"], "groups": groups}
+    try:
+        plan = agy_plan(headers)
+    except Exception:  # the plan is a nice-to-have; never lose the quota over it
+        plan = None
+    return {"plan": plan, "five_hour": main["five_hour"], "weekly": main["weekly"], "groups": groups}
 
 
 MUSE_DIR = os.path.join(HOME, ".local", "share", "muse")

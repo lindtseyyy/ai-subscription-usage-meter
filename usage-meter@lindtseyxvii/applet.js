@@ -1,5 +1,6 @@
 const Applet = imports.ui.applet;
 const PopupMenu = imports.ui.popupMenu;
+const Settings = imports.ui.settings;
 const Gio = imports.gi.Gio;
 const GLib = imports.gi.GLib;
 const St = imports.gi.St;
@@ -21,6 +22,13 @@ function colorFor(pct) {
 // St styles survive the panel theme; Pango colour markup does not.
 function lbl(text, style) {
     return new St.Label({ text: String(text), style: style || "", y_align: Clutter.ActorAlign.CENTER });
+}
+
+// Long text (errors) wraps instead of stretching a column.
+function wrapLbl(text, style) {
+    let l = lbl(text, style);
+    l.clutter_text.line_wrap = true;
+    return l;
 }
 
 function row(...children) {
@@ -49,8 +57,8 @@ function untilText(epoch) {
     return `resets in ${rel} (${at})`;
 }
 
-function bar(pct, color) {
-    const n = 20, filled = Math.round(Math.min(pct, 100) / 100 * n);
+function bar(pct, color, n) {
+    let filled = Math.round(Math.min(pct, 100) / 100 * n);
     let box = new St.BoxLayout();
     box.add_child(lbl("█".repeat(filled), `color: ${color};`));
     box.add_child(lbl("█".repeat(n - filled), "color: rgba(128,128,128,0.35);"));
@@ -70,6 +78,10 @@ class UsageMeterApplet extends Applet.Applet {
         this.busy = {};
         this.timers = [];
 
+        this.settings = new Settings.AppletSettings(this, metadata.uuid, instanceId);
+        this.settings.bind("menu-layout", "menuLayout", () => this._rebuildIfOpen());
+        for (let [key] of SERVICES) this.settings.bind("show-" + key, "show_" + key, () => this._onServicesChanged());
+
         this.box = new St.BoxLayout({ style: "spacing: 4px;", y_align: Clutter.ActorAlign.CENTER });
         this.actor.add_child(this.box);
 
@@ -82,6 +94,20 @@ class UsageMeterApplet extends Applet.Applet {
         this._refresh();
         this._every(REFRESH_SECONDS, () => this._refresh());
         this._every(MUSE_REFRESH_SECONDS, () => this._refresh("muse"));
+    }
+
+    _enabled() {
+        return SERVICES.filter(([key]) => this["show_" + key]);
+    }
+
+    _onServicesChanged() {
+        this._render();
+        this._rebuildIfOpen();
+        this._refresh(); // picks up a service that was just switched on
+    }
+
+    _rebuildIfOpen() {
+        if (this.menu.isOpen) this._buildMenu();
     }
 
     _every(seconds, fn) {
@@ -106,10 +132,19 @@ class UsageMeterApplet extends Applet.Applet {
     // only: refresh a single source and merge it into the last full result.
     _refresh(only) {
         let tag = only || "all";
+        let keys = this._enabled().map(([key]) => key).filter(k => !only || k === only);
         if (this.busy[tag] || (only && !this.data)) return;
+        if (!keys.length) { // nothing selected (or this source is switched off)
+            if (!only) {
+                this.data = { updated: Math.floor(Date.now() / 1000) };
+                this.loaded = true;
+                this._render();
+            }
+            return;
+        }
         this.busy[tag] = true;
         try {
-            let argv = ["python3", "-I", this.script].concat(only ? [only] : []);
+            let argv = ["python3", "-I", this.script].concat(keys);
             let proc = Gio.Subprocess.new(argv, Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE);
             proc.communicate_utf8_async(null, null, (p, res) => {
                 this.busy[tag] = false;
@@ -117,7 +152,7 @@ class UsageMeterApplet extends Applet.Applet {
                     let [, out] = p.communicate_utf8_finish(res);
                     let fresh = JSON.parse(out);
                     if (only) this.data[only] = fresh[only];
-                    else this.data = fresh;
+                    else this.data = Object.assign(this.data || {}, fresh);
                 } catch (e) {
                     global.logError("usage-meter: " + e);
                     if (!only) this.data = null;
@@ -138,7 +173,13 @@ class UsageMeterApplet extends Applet.Applet {
             return;
         }
         let kids = [], tips = [];
-        SERVICES.forEach(([key, name], i) => {
+        let services = this._enabled();
+        if (!services.length) {
+            this._setPanel([lbl("AI usage", DIM)]);
+            this.set_applet_tooltip("No subscriptions selected - click, then Settings");
+            return;
+        }
+        services.forEach(([key, name], i) => {
             let s = this.data[key] || {};
             if (i > 0) kids.push(lbl(" │ ", "color: rgba(200,200,200,0.4);"));
             kids.push(this._logo(key, Math.min(this.getPanelIconSize(St.IconType.FULLCOLOR), 18)) ||
@@ -179,34 +220,21 @@ class UsageMeterApplet extends Applet.Applet {
     _buildMenu() {
         this.menu.removeAll();
         let d = this.data || {};
-        for (let [key, name] of SERVICES) {
-            let s = d[key] || {};
-            let head = [this._logo(key, 18), lbl(name, "font-weight: bold;")].filter(Boolean);
-            if (s.plan) head.push(lbl(`(${s.plan})`, DIM));
-            this._addItem(row(...head));
-            // Antigravity splits its quota into model groups; the panel shows the Gemini one.
-            let groups = s.groups || (s.five_hour ? [s] : []);
-            for (let g of groups) {
-                if (g.name) this._addItem(lbl(g.name, DIM + " font-size: 0.9em;"));
-                for (let [w, , long] of WINDOWS) {
-                    let { pct, resets_at } = g[w];
-                    let c = colorFor(pct);
-                    let col = new St.BoxLayout({ vertical: true });
-                    col.add_child(row(bar(pct, c),
-                        lbl((pct > 0 && pct < 10 ? pct.toFixed(1) : Math.round(pct)) + "%",
-                            `color: ${c}; font-weight: bold; min-width: 3em; text-align: right;`),
-                        lbl(long)));
-                    col.add_child(lbl(untilText(resets_at), DIM + " font-size: 0.85em;"));
-                    this._addItem(col);
-                }
-            }
-            if (s.sessions) this._addSessionItems(s.sessions);
-            if (s.error) {
-                let when = s.fetched ? ` - showing data from ${GLib.DateTime.new_from_unix_local(s.fetched).format("%H:%M")}` : "";
-                this._addItem(lbl("⚠ " + s.error + when, WARN + " font-size: 0.85em;"));
-            }
-            this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
+        let services = this._enabled();
+        let horizontal = this.menuLayout === "horizontal";
+        if (!services.length) {
+            this._addItem(lbl("No subscriptions selected", DIM));
+        } else if (horizontal) {
+            let cols = new St.BoxLayout({ style: "spacing: 28px;" });
+            for (let [key, name] of services) cols.add_child(this._serviceColumn(key, name, d[key] || {}, true));
+            this._addItem(cols);
+        } else {
+            services.forEach(([key, name], i) => {
+                if (i > 0) this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
+                this._addItem(this._serviceColumn(key, name, d[key] || {}, false));
+            });
         }
+        this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
         if (d.updated) {
             this._addItem(lbl("Updated " + GLib.DateTime.new_from_unix_local(d.updated).format("%H:%M:%S"),
                 DIM + " font-size: 0.85em;"));
@@ -216,23 +244,57 @@ class UsageMeterApplet extends Applet.Applet {
         let refresh = new PopupMenu.PopupIconMenuItem("Refresh now", "view-refresh", St.IconType.SYMBOLIC);
         refresh.connect("activate", () => this._refresh());
         this.menu.addMenuItem(refresh);
+        let settings = new PopupMenu.PopupIconMenuItem("Settings", "preferences-system", St.IconType.SYMBOLIC);
+        settings.connect("activate", () => this.configureApplet());
+        this.menu.addMenuItem(settings);
     }
 
-    _addSessionItems(sessions) {
+    // One subscription's block; compact = narrower bars for the side-by-side layout.
+    _serviceColumn(key, name, s, compact) {
+        let col = new St.BoxLayout({ vertical: true, style: "spacing: 6px;" + (compact ? " max-width: 20em;" : "") });
+        let head = [this._logo(key, 18), lbl(name, "font-weight: bold;")].filter(Boolean);
+        if (s.plan) head.push(lbl(`(${s.plan})`, DIM));
+        col.add_child(row(...head));
+        // Antigravity splits its quota into model groups; the panel shows the Gemini one.
+        let groups = s.groups || (s.five_hour ? [s] : []);
+        for (let g of groups) {
+            if (g.name) col.add_child(lbl(g.name, DIM + " font-size: 0.9em;"));
+            for (let [w, , long] of WINDOWS) {
+                let { pct, resets_at } = g[w];
+                let c = colorFor(pct);
+                let block = new St.BoxLayout({ vertical: true });
+                block.add_child(row(bar(pct, c, compact ? 10 : 20),
+                    lbl((pct > 0 && pct < 10 ? pct.toFixed(1) : Math.round(pct)) + "%",
+                        `color: ${c}; font-weight: bold; min-width: 3em; text-align: right;`),
+                    lbl(long)));
+                block.add_child(lbl(untilText(resets_at), DIM + " font-size: 0.85em;"));
+                col.add_child(block);
+            }
+        }
+        if (s.sessions) this._addSessionRows(col, s.sessions);
+        if (s.error) {
+            let when = s.fetched ? ` - showing data from ${GLib.DateTime.new_from_unix_local(s.fetched).format("%H:%M")}` : "";
+            col.add_child(wrapLbl("⚠ " + s.error + when, WARN + " font-size: 0.85em;"));
+        }
+        return col;
+    }
+
+    _addSessionRows(col, sessions) {
         if (!sessions.length) {
-            this._addItem(lbl("No Muse session running", DIM));
+            col.add_child(lbl("No Muse session running", DIM));
             return;
         }
         for (let x of sessions) {
             let started = x.started ? " · started " + GLib.DateTime.new_from_unix_local(x.started).format("%H:%M") : "";
-            let col = new St.BoxLayout({ vertical: true });
-            col.add_child(row(lbl(GLib.path_get_basename(x.cwd), "min-width: 10em;"),
-                lbl(x.usd === null ? "?" : money(x.usd), "font-weight: bold;")));
-            col.add_child(lbl(`${x.calls} calls · ${tokens(x.input)} input (${tokens(x.cached)} cached) · ${tokens(x.output)} output${started}`,
+            let block = new St.BoxLayout({ vertical: true });
+            block.add_child(row(lbl(GLib.path_get_basename(x.cwd), "min-width: 8em;"),
+                lbl(x.usd === null ? "?" : money(x.usd), `color: ${colorFor(0)}; font-weight: bold;`)));
+            block.add_child(lbl(`${x.calls} calls${started}`, DIM + " font-size: 0.85em;"));
+            block.add_child(lbl(`${tokens(x.input)} input (${tokens(x.cached)} cached) · ${tokens(x.output)} output`,
                 DIM + " font-size: 0.85em;"));
-            this._addItem(col);
+            col.add_child(block);
         }
-        this._addItem(lbl("Session cost, same totals as Muse's /usage", DIM + " font-size: 0.85em;"));
+        col.add_child(wrapLbl("Session cost, same totals as Muse's /usage", DIM + " font-size: 0.85em;"));
     }
 
     on_applet_clicked() {

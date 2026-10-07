@@ -1,0 +1,44 @@
+{
+    "layout-section": {
+        "type": "section",
+        "description": "Dropdown layout"
+    },
+    "menu-layout": {
+        "type": "combobox",
+        "default": "vertical",
+        "description": "Arrange subscriptions",
+        "options": {
+            "Vertical (stacked)": "vertical",
+            "Horizontal (one column each)": "horizontal"
+        },
+        "tooltip": "How the subscriptions are laid out in the dropdown when you click the meter."
+    },
+    "services-section": {
+        "type": "section",
+        "description": "Subscriptions to show"
+    },
+    "show-claude": {
+        "type": "switch",
+        "default": true,
+        "description": "Claude",
+        "tooltip": "5-hour and weekly usage of your Claude plan."
+    },
+    "show-codex": {
+        "type": "switch",
+        "default": true,
+        "description": "Codex",
+        "tooltip": "5-hour and weekly usage of your ChatGPT plan in Codex."
+    },
+    "show-agy": {
+        "type": "switch",
+        "default": true,
+        "description": "Antigravity",
+        "tooltip": "5-hour and weekly usage of Google AI Pro in Antigravity (agy)."
+    },
+    "show-muse": {
+        "type": "switch",
+        "default": true,
+        "description": "Muse",
+        "tooltip": "Cost of the running Muse Code session."
+    }
+}

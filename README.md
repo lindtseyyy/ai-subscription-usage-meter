@@ -8,13 +8,20 @@ A Linux Mint **Cinnamon panel applet** that shows how much of your AI coding sub
 
 | Service | What it shows | Source |
 |---|---|---|
-| **Claude** (Claude Code / claude.ai plan) | 5-hour and weekly usage % | Claude Code's login in `~/.claude/.credentials.json` |
-| **Codex** (ChatGPT plan) | 5-hour and weekly usage % | Codex's login in `~/.codex/auth.json` |
-| **Antigravity** (Google AI Pro, `agy` CLI) | 5-hour and weekly usage % per model group (Gemini; Claude & GPT) | `agy`'s login in the GNOME keyring |
+| **Claude** (Claude Code / claude.ai plan) | Plan name, 5-hour and weekly usage % | Claude Code's login in `~/.claude/.credentials.json` |
+| **Codex** (ChatGPT plan) | Plan name, 5-hour and weekly usage % | Codex's login in `~/.codex/auth.json` |
+| **Antigravity** (Google AI Pro, `agy` CLI) | Plan name, 5-hour and weekly usage % per model group (Gemini; Claude & GPT) | `agy`'s login in the GNOME keyring |
 | **Muse Code** (Meta, API-billed) | Cost of the currently running session(s) | Muse's local session logs + model catalog prices |
 
 Percentages are colour-coded: 🟢 under 50% · 🟡 50–74% · 🟠 75–89% · 🔴 90%+.
-Click the meter for a dropdown with usage bars, reset countdowns and a **Refresh now** button.
+Click the meter for a dropdown with usage bars, reset countdowns, and **Refresh now** / **Settings** buttons.
+
+## Settings
+
+Open them from the dropdown's **Settings** button (or right-click the meter → **Configure…**):
+
+- **Arrange subscriptions**: *Vertical* stacks each subscription in the dropdown; *Horizontal* gives each one its own column side by side.
+- **Subscriptions to show**: switch Claude, Codex, Antigravity and Muse on or off. Hidden ones disappear from the panel and dropdown and aren't fetched at all.
 
 ## Requirements
 
@@ -48,6 +55,7 @@ usage-meter@lindtseyxvii/
 ├── applet.js        # Cinnamon applet: panel text, colours, dropdown menu, timers
 ├── usage_fetch.py   # Fetches usage from each service and prints JSON
 ├── metadata.json    # Applet metadata
+├── settings-schema.json  # Settings page (layout, which subscriptions to show)
 └── icons/           # Service logos shown in the panel
 ```
 
