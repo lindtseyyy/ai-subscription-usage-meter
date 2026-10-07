@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Local machine state (panel layout backup made during install)
+.enabled-applets.backup
+
+# Never commit credentials or cached tokens
+*.token.json
+auth.json
+.credentials.json
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store

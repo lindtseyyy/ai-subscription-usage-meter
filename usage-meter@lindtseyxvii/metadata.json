@@ -1,0 +1,7 @@
+{
+    "uuid": "usage-meter@lindtseyxvii",
+    "name": "AI Usage Meter",
+    "description": "Claude and Codex 5-hour and weekly usage in the panel",
+    "max-instances": 1,
+    "version": "1.0"
+}
