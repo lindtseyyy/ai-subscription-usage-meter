@@ -1,14 +1,16 @@
 const Applet = imports.ui.applet;
-const PopupMenu = imports.ui.popupMenu;
+const Main = imports.ui.main;
 const Settings = imports.ui.settings;
+const Tooltips = imports.ui.tooltips;
 const Gio = imports.gi.Gio;
 const GLib = imports.gi.GLib;
 const St = imports.gi.St;
 const Clutter = imports.gi.Clutter;
+const Gtk = imports.gi.Gtk;
+const Pango = imports.gi.Pango;
 
 const REFRESH_SECONDS = 180;
-const MUSE_REFRESH_SECONDS = 30; // local file read, so it can be quick
-const SERVICES = [["claude", "Claude"], ["codex", "Codex"], ["agy", "Antigravity"], ["muse", "Muse"]];
+const SERVICES = [["claude", "Claude"], ["codex", "Codex"], ["commandcode", "CommandCode"], ["agy", "Antigravity"], ["mistral", "Mistral"]];
 const WINDOWS = [["five_hour", "5h", "5-hour"], ["weekly", "W", "Weekly"]];
 
 // Green while there's plenty left, shifting to red as it nears 100%.
@@ -28,6 +30,8 @@ function lbl(text, style) {
 function wrapLbl(text, style) {
     let l = lbl(text, style);
     l.clutter_text.line_wrap = true;
+    l.clutter_text.ellipsize = Pango.EllipsizeMode.NONE;
+    l.clutter_text.line_wrap_mode = Pango.WrapMode.WORD_CHAR;
     return l;
 }
 
@@ -35,16 +39,6 @@ function row(...children) {
     let box = new St.BoxLayout({ style: "spacing: 4px;" });
     for (let c of children) box.add_child(c);
     return box;
-}
-
-function money(usd) {
-    // Session costs are often fractions of a cent, so keep more digits when small.
-    let dp = usd === 0 || usd >= 1 ? 2 : usd >= 0.01 ? 3 : 4;
-    return "$" + usd.toFixed(dp);
-}
-
-function tokens(n) {
-    return n >= 1e6 ? (n / 1e6).toFixed(1) + "M" : n >= 1e3 ? (n / 1e3).toFixed(1) + "k" : String(n);
 }
 
 function untilText(epoch) {
@@ -65,35 +59,36 @@ function bar(pct, color, n) {
     return box;
 }
 
+function fmt(n) {
+    return n != null ? +Number(n).toFixed(2) : "";
+}
+
 const DIM = "color: rgba(200,200,200,0.65);";
 const WARN = "color: #ffa726;";
 
-class UsageMeterApplet extends Applet.Applet {
+class UsageMeterApplet extends Applet.IconApplet {
     constructor(metadata, orientation, panelHeight, instanceId) {
         super(orientation, panelHeight, instanceId);
         this.script = GLib.build_filenamev([metadata.path, "usage_fetch.py"]);
         this.iconDir = GLib.build_filenamev([metadata.path, "icons"]);
         this.data = null;
         this.loaded = false;
-        this.busy = {};
+        this.busy = false;
         this.timers = [];
 
+        this.hotkeyName = `${metadata.uuid}-drawer-${instanceId}`;
         this.settings = new Settings.AppletSettings(this, metadata.uuid, instanceId);
-        this.settings.bind("menu-layout", "menuLayout", () => this._rebuildIfOpen());
+        this.settings.bind("toggle-shortcut", "toggleShortcut", () => this._bindShortcut());
         for (let [key] of SERVICES) this.settings.bind("show-" + key, "show_" + key, () => this._onServicesChanged());
-
-        this.box = new St.BoxLayout({ style: "spacing: 4px;", y_align: Clutter.ActorAlign.CENTER });
-        this.actor.add_child(this.box);
-
-        this.menuManager = new PopupMenu.PopupMenuManager(this);
-        this.menu = new Applet.AppletPopupMenu(this, orientation);
-        this.menuManager.addMenu(this.menu);
-
-        this._setPanel([lbl("AI usage …", DIM)]);
-        this.set_applet_tooltip("Loading usage…");
+        this.set_applet_icon_symbolic_name("utilities-system-monitor-symbolic");
+        this._createDrawer();
+        this._bindShortcut();
+        this._monitorSignal = Main.layoutManager.connect("monitors-changed", () => this._closeDrawer());
+        this._workareaSignal = global.display.connect("workareas-changed", () => {
+            if (this.isOpen) this._positionDrawer();
+        });
         this._refresh();
         this._every(REFRESH_SECONDS, () => this._refresh());
-        this._every(MUSE_REFRESH_SECONDS, () => this._refresh("muse"));
     }
 
     _enabled() {
@@ -101,13 +96,12 @@ class UsageMeterApplet extends Applet.Applet {
     }
 
     _onServicesChanged() {
-        this._render();
         this._rebuildIfOpen();
         this._refresh(); // picks up a service that was just switched on
     }
 
     _rebuildIfOpen() {
-        if (this.menu.isOpen) this._buildMenu();
+        if (this.isOpen) this._buildBody();
     }
 
     _every(seconds, fn) {
@@ -124,154 +118,200 @@ class UsageMeterApplet extends Applet.Applet {
         return new St.Icon({ gicon: new Gio.FileIcon({ file }), icon_size: size, y_align: Clutter.ActorAlign.CENTER });
     }
 
-    _setPanel(children) {
-        this.box.destroy_all_children();
-        for (let c of children) this.box.add_child(c);
-    }
-
-    // only: refresh a single source and merge it into the last full result.
-    _refresh(only) {
-        let tag = only || "all";
-        let keys = this._enabled().map(([key]) => key).filter(k => !only || k === only);
-        if (this.busy[tag] || (only && !this.data)) return;
-        if (!keys.length) { // nothing selected (or this source is switched off)
-            if (!only) {
-                this.data = { updated: Math.floor(Date.now() / 1000) };
-                this.loaded = true;
-                this._render();
-            }
+    _refresh() {
+        if (this.destroyed) return;
+        let keys = this._enabled().map(([key]) => key);
+        if (this.busy) return;
+        if (!keys.length) { // nothing selected
+            this.data = { updated: Math.floor(Date.now() / 1000) };
+            this.loaded = true;
+            this._rebuildIfOpen();
             return;
         }
-        this.busy[tag] = true;
+        this.busy = true;
+        this._rebuildIfOpen();
         try {
             let argv = ["python3", "-I", this.script].concat(keys);
             let proc = Gio.Subprocess.new(argv, Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE);
             proc.communicate_utf8_async(null, null, (p, res) => {
-                this.busy[tag] = false;
+                if (this.destroyed) return;
+                this.busy = false;
                 try {
                     let [, out] = p.communicate_utf8_finish(res);
-                    let fresh = JSON.parse(out);
-                    if (only) this.data[only] = fresh[only];
-                    else this.data = Object.assign(this.data || {}, fresh);
+                    this.data = Object.assign(this.data || {}, JSON.parse(out));
                 } catch (e) {
                     global.logError("usage-meter: " + e);
-                    if (!only) this.data = null;
+                    this.data = null;
                 }
                 this.loaded = true;
-                this._render();
+                this._rebuildIfOpen();
             });
         } catch (e) {
-            this.busy[tag] = false;
+            this.busy = false;
             global.logError("usage-meter: " + e);
+            this.loaded = true;
+            this._rebuildIfOpen();
         }
     }
 
-    _render() {
-        if (!this.data) {
-            this._setPanel([lbl("AI usage: error", "color: #ef5350;")]);
-            this.set_applet_tooltip("Fetcher failed - see ~/.xsession-errors");
-            return;
-        }
-        let kids = [], tips = [];
-        let services = this._enabled();
-        if (!services.length) {
-            this._setPanel([lbl("AI usage", DIM)]);
-            this.set_applet_tooltip("No subscriptions selected - click, then Settings");
-            return;
-        }
-        services.forEach(([key, name], i) => {
-            let s = this.data[key] || {};
-            if (i > 0) kids.push(lbl(" │ ", "color: rgba(200,200,200,0.4);"));
-            kids.push(this._logo(key, Math.min(this.getPanelIconSize(St.IconType.FULLCOLOR), 18)) ||
-                lbl(name, "font-weight: bold;"));
-            if (s.sessions) {
-                // API-billed: no limit to colour against, so show the live session cost in the low-usage green.
-                if (s.sessions.length) {
-                    let usd = s.sessions.reduce((t, x) => t + (x.usd || 0), 0);
-                    kids.push(lbl(money(usd), `color: ${colorFor(0)}; font-weight: bold;` + (s.stale ? " opacity: 0.55;" : "")));
-                    if (s.sessions.length > 1) kids.push(lbl(`×${s.sessions.length}`, DIM));
-                } else {
-                    kids.push(lbl("idle", DIM));
-                }
-            } else if (!s.five_hour) {
-                kids.push(lbl("—", DIM));
-            } else {
-                WINDOWS.forEach(([w, short], j) => {
-                    if (j > 0) kids.push(lbl("·", DIM));
-                    let pct = s[w].pct;
-                    kids.push(lbl(short, DIM));
-                    kids.push(lbl(Math.round(pct) + "%",
-                        `color: ${colorFor(pct)}; font-weight: bold;` + (s.stale ? " opacity: 0.55;" : "")));
-                });
+    _bindShortcut() {
+        Main.keybindingManager.removeHotKey(this.hotkeyName);
+        let shortcut = this.toggleShortcut || "";
+        let registered = !shortcut || Main.keybindingManager.addHotKey(this.hotkeyName, shortcut, () => this._toggleDrawer());
+        let description = shortcut.replace(/<([^>]+)>/g, "$1+").replace(/::/g, " / ");
+        let name = "AI Usage Meter" + (description ? ` (${description})` : "");
+        this.actor.accessible_name = name;
+        this.set_applet_tooltip(name + (registered ? "" : " — shortcut unavailable; choose another in Settings"));
+        if (!registered) Main.notifyError("AI Usage Meter", `Cannot register ${description}. It may already be in use. Choose another shortcut in the applet settings.`);
+    }
+
+    _button(text, action, iconName) {
+        let button = new St.Button({ style_class: "notification-button", can_focus: true, reactive: true, accessible_name: text });
+        button.set_child(new St.Icon({ icon_name: iconName, icon_type: St.IconType.SYMBOLIC, icon_size: 16 }));
+        new Tooltips.Tooltip(button, text);
+        button.connect("clicked", action);
+        return button;
+    }
+
+    _createDrawer() {
+        this.overlay = new St.Widget({ reactive: true, visible: false });
+        this.drawer = new St.BoxLayout({ vertical: true, reactive: true, style_class: "dialog modal-dialog", style: "padding: 16px; spacing: 12px; border-radius: 0;" });
+        this.overlay.add_child(this.drawer);
+        let header = new St.BoxLayout({ style: "spacing: 6px;" });
+        header.add(lbl("AI Usage Meter", "font-weight: bold; font-size: 1.2em;"), { expand: true });
+        header.add_child(this._button("Refresh now", () => this._refresh(), "view-refresh-symbolic"));
+        header.add_child(this._button("Settings", () => {
+            this._closeDrawer();
+            this.configureApplet();
+        }, "emblem-system-symbolic"));
+        this.closeButton = this._button("Close", () => this._closeDrawer(), "window-close-symbolic");
+        header.add_child(this.closeButton);
+        this.drawer.add_child(header);
+        this.status = wrapLbl("", DIM + " font-size: 0.85em;");
+        this.drawer.add_child(this.status);
+        this.scroll = new St.ScrollView({ style_class: "vfade", can_focus: true, reactive: true, x_expand: true, y_expand: true });
+        this.scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC);
+        this.body = new St.BoxLayout({ vertical: true, style: "spacing: 18px;" });
+        this.scroll.add_actor(this.body);
+        this.drawer.add(this.scroll, { expand: true, x_fill: true, y_fill: true });
+        this.overlay.connect("button-press-event", (_actor, event) => {
+            if (!this.drawer.contains(event.get_source())) {
+                this._closeDrawer();
+                return Clutter.EVENT_STOP;
             }
-            if (s.error) kids.push(lbl("⚠", WARN));
-            tips.push(`${name}: ` + (s.error || "ok"));
+            return Clutter.EVENT_PROPAGATE;
         });
-        this._setPanel(kids);
-        this.set_applet_tooltip(tips.join("\n") + "\nClick for details");
+        this.overlay.connect("key-press-event", (_actor, event) => {
+            let key = event.get_key_symbol();
+            if (key === Clutter.KEY_Escape) {
+                this._closeDrawer();
+                return Clutter.EVENT_STOP;
+            }
+            if (key === Clutter.KEY_Tab || key === Clutter.KEY_ISO_Left_Tab) {
+                this.drawer.navigate_focus(global.stage.get_key_focus(),
+                    event.get_state() & Clutter.ModifierType.SHIFT_MASK ? Gtk.DirectionType.TAB_BACKWARD : Gtk.DirectionType.TAB_FORWARD, true);
+                return Clutter.EVENT_STOP;
+            }
+            let adjustment = this.scroll.vscroll.adjustment;
+            let delta = key === Clutter.KEY_Down ? adjustment.step_increment :
+                key === Clutter.KEY_Up ? -adjustment.step_increment :
+                key === Clutter.KEY_Page_Down ? adjustment.page_increment :
+                key === Clutter.KEY_Page_Up ? -adjustment.page_increment : 0;
+            if (delta || key === Clutter.KEY_Home || key === Clutter.KEY_End) {
+                adjustment.value = Math.max(adjustment.lower, Math.min(adjustment.upper - adjustment.page_size,
+                    key === Clutter.KEY_Home ? adjustment.lower : key === Clutter.KEY_End ? adjustment.upper : adjustment.value + delta));
+                return Clutter.EVENT_STOP;
+            }
+            return Clutter.EVENT_PROPAGATE;
+        });
+        Main.layoutManager.addChrome(this.overlay, { affectsStruts: false, visibleInFullscreen: true });
     }
 
-    _addItem(actor) {
-        let item = new PopupMenu.PopupBaseMenuItem({ reactive: false });
-        item.addActor(actor);
-        this.menu.addMenuItem(item);
+    _positionDrawer() {
+        this.overlay.set_position(0, 0);
+        this.overlay.set_size(global.screen_width, global.screen_height);
+        let area = global.workspace_manager.get_active_workspace().get_work_area_for_monitor(this.monitorIndex);
+        let width = Math.min(420, area.width);
+        this.drawer.set_position(area.x + area.width - width, area.y);
+        this.drawer.set_size(width, area.height);
     }
 
-    _buildMenu() {
-        this.menu.removeAll();
-        let d = this.data || {};
+    _toggleDrawer() {
+        if (this.isOpen) {
+            this._closeDrawer();
+            return;
+        }
+        let extended = Main.layoutManager.monitors.find(m => m.index !== Main.layoutManager.primaryIndex);
+        this.monitorIndex = extended ? extended.index : Main.layoutManager.primaryIndex;
+        this._positionDrawer();
+        this._buildBody();
+        this.overlay.show();
+        if (!Main.pushModal(this.overlay)) {
+            this.overlay.hide();
+            Main.notifyError("AI Usage Meter", "Cannot open the sidebar while another system dialog is active.");
+            return;
+        }
+        this.isOpen = true;
+        this.closeButton.grab_key_focus();
+        if (!this.loaded) this._refresh();
+    }
+
+    _closeDrawer() {
+        if (!this.isOpen) return;
+        this.isOpen = false;
+        Main.popModal(this.overlay);
+        this.overlay.hide();
+    }
+
+    _buildBody() {
+        let adjustment = this.scroll.vscroll.adjustment;
+        let position = adjustment.value;
+        this.body.destroy_all_children();
         let services = this._enabled();
-        let horizontal = this.menuLayout === "horizontal";
-        if (!services.length) {
-            this._addItem(lbl("No subscriptions selected", DIM));
-        } else if (horizontal) {
-            let cols = new St.BoxLayout({ style: "spacing: 28px;" });
-            for (let [key, name] of services) cols.add_child(this._serviceColumn(key, name, d[key] || {}, true));
-            this._addItem(cols);
-        } else {
-            services.forEach(([key, name], i) => {
-                if (i > 0) this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
-                this._addItem(this._serviceColumn(key, name, d[key] || {}, false));
-            });
-        }
-        this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
-        if (d.updated) {
-            this._addItem(lbl("Updated " + GLib.DateTime.new_from_unix_local(d.updated).format("%H:%M:%S"),
-                DIM + " font-size: 0.85em;"));
-        } else if (this.loaded) {
-            this._addItem(lbl("Fetcher failed - see ~/.xsession-errors", WARN));
-        }
-        let refresh = new PopupMenu.PopupIconMenuItem("Refresh now", "view-refresh", St.IconType.SYMBOLIC);
-        refresh.connect("activate", () => this._refresh());
-        this.menu.addMenuItem(refresh);
-        let settings = new PopupMenu.PopupIconMenuItem("Settings", "preferences-system", St.IconType.SYMBOLIC);
-        settings.connect("activate", () => this.configureApplet());
-        this.menu.addMenuItem(settings);
+        if (!services.length) this.body.add_child(wrapLbl("No subscriptions selected. Choose services in Settings.", DIM));
+        else if (!this.loaded && !this.data) this.body.add_child(lbl("Loading usage…", DIM));
+        else if (!this.data) this.body.add_child(wrapLbl("Fetcher failed — see ~/.xsession-errors", WARN));
+        else for (let [key, name] of services) this.body.add_child(this._serviceColumn(key, name, this.data[key] || {}));
+        this.status.set_text(this.busy ? "Refreshing usage…" : this.data && this.data.updated ?
+            "Updated " + GLib.DateTime.new_from_unix_local(this.data.updated).format("%H:%M:%S") : "");
+        adjustment.value = position;
     }
 
-    // One subscription's block; compact = narrower bars for the side-by-side layout.
-    _serviceColumn(key, name, s, compact) {
-        let col = new St.BoxLayout({ vertical: true, style: "spacing: 6px;" + (compact ? " max-width: 20em;" : "") });
+    // Providers, model groups and accounts all follow the same vertical reading order.
+    _serviceColumn(key, name, s) {
+        let col = new St.BoxLayout({ vertical: true, style: "spacing: 8px; padding: 12px; background-color: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.14); border-radius: 10px;" });
         let head = [this._logo(key, 18), lbl(name, "font-weight: bold;")].filter(Boolean);
         if (s.plan) head.push(lbl(`(${s.plan})`, DIM));
-        col.add_child(row(...head));
-        // Antigravity splits its quota into model groups; the panel shows the Gemini one.
-        let groups = s.groups || (s.five_hour ? [s] : []);
-        for (let g of groups) {
-            if (g.name) col.add_child(lbl(g.name, DIM + " font-size: 0.9em;"));
-            for (let [w, , long] of WINDOWS) {
-                let { pct, resets_at } = g[w];
+        let heading = row(...head);
+        heading.set_style("spacing: 6px; padding: 8px; background-color: rgba(255,255,255,0.09); border-radius: 6px;");
+        col.add_child(heading);
+        for (let a of s.groups || s.accounts || [s]) {
+            let box = new St.BoxLayout({ vertical: true, style: "spacing: 6px;" });
+            col.add_child(box);
+            if (a.account) box.add_child(wrapLbl(a.account, s.accounts ? "font-weight: bold;" : DIM + " font-size: 0.85em;"));
+            if (a.note) box.add_child(wrapLbl(a.note, DIM + " font-size: 0.85em;"));
+            if (a.name) box.add_child(wrapLbl(a.name, "font-weight: bold;"));
+            let quotas = a.quotas || WINDOWS.filter(([w]) => a[w]).map(([w, , label]) => Object.assign({ label }, a[w]));
+            for (let quota of quotas) {
+                let { pct, resets_at, label } = quota;
                 let c = colorFor(pct);
                 let block = new St.BoxLayout({ vertical: true });
-                block.add_child(row(bar(pct, c, compact ? 10 : 20),
+                block.add_child(row(bar(pct, c, 10),
                     lbl((pct > 0 && pct < 10 ? pct.toFixed(1) : Math.round(pct)) + "%",
                         `color: ${c}; font-weight: bold; min-width: 3em; text-align: right;`),
-                    lbl(long)));
+                    lbl(s.groups ? label.replace(a.name + " ", "").replace("Five Hour Limit", "5-hour").replace("Weekly Limit", "Weekly") : label)));
+                if (quota.limit != null) {
+                    let used = quota.used != null ? fmt(quota.used) + " / " : "";
+                    block.add_child(lbl(`${used}${fmt(quota.limit)} ${quota.unit || "credits"}`, DIM + " font-size: 0.85em;"));
+                }
                 block.add_child(lbl(untilText(resets_at), DIM + " font-size: 0.85em;"));
-                col.add_child(block);
+                box.add_child(block);
             }
+            if (a.balance && a.balance.remaining != null) {
+                box.add_child(lbl(`Balance: ${fmt(a.balance.remaining)} ${a.balance.unit || "credits"}`, DIM + " font-size: 0.85em;"));
+            }
+            if (a !== s && a.error) box.add_child(wrapLbl("⚠ " + a.error, WARN + " font-size: 0.85em;"));
         }
-        if (s.sessions) this._addSessionRows(col, s.sessions);
         if (s.error) {
             let when = s.fetched ? ` - showing data from ${GLib.DateTime.new_from_unix_local(s.fetched).format("%H:%M")}` : "";
             col.add_child(wrapLbl("⚠ " + s.error + when, WARN + " font-size: 0.85em;"));
@@ -279,30 +319,24 @@ class UsageMeterApplet extends Applet.Applet {
         return col;
     }
 
-    _addSessionRows(col, sessions) {
-        if (!sessions.length) {
-            col.add_child(lbl("No Muse session running", DIM));
-            return;
-        }
-        for (let x of sessions) {
-            let started = x.started ? " · started " + GLib.DateTime.new_from_unix_local(x.started).format("%H:%M") : "";
-            let block = new St.BoxLayout({ vertical: true });
-            block.add_child(row(lbl(GLib.path_get_basename(x.cwd), "min-width: 8em;"),
-                lbl(x.usd === null ? "?" : money(x.usd), `color: ${colorFor(0)}; font-weight: bold;`)));
-            block.add_child(lbl(`${x.calls} calls${started}`, DIM + " font-size: 0.85em;"));
-            block.add_child(lbl(`${tokens(x.input)} input (${tokens(x.cached)} cached) · ${tokens(x.output)} output`,
-                DIM + " font-size: 0.85em;"));
-            col.add_child(block);
-        }
-        col.add_child(wrapLbl("Session cost, same totals as Muse's /usage", DIM + " font-size: 0.85em;"));
+    on_applet_clicked() {
+        this._toggleDrawer();
+    }
+    configureApplet(tab = 0) {
+        this._closeDrawer();
+        super.configureApplet(tab);
     }
 
-    on_applet_clicked() {
-        if (!this.menu.isOpen) this._buildMenu(); // keeps the reset countdowns current
-        this.menu.toggle();
-    }
 
     on_applet_removed_from_panel() {
+        this.destroyed = true;
+        this._closeDrawer();
+        Main.keybindingManager.removeHotKey(this.hotkeyName);
+        Main.layoutManager.disconnect(this._monitorSignal);
+        global.display.disconnect(this._workareaSignal);
+        Main.layoutManager.removeChrome(this.overlay);
+        this.overlay.destroy();
+        this.settings.finalize();
         for (let t of this.timers) GLib.source_remove(t);
         this.timers = [];
     }

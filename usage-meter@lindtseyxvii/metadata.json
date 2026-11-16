@@ -1,7 +1,7 @@
 {
     "uuid": "usage-meter@lindtseyxvii",
     "name": "AI Usage Meter",
-    "description": "Claude and Codex 5-hour and weekly usage in the panel",
+    "description": "Claude, Codex, CommandCode, Antigravity and Mistral usage in a scrollable right-side panel",
     "max-instances": 1,
     "version": "1.0"
 }
